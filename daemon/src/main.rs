@@ -102,7 +102,6 @@ impl GreeterProxy {
             user_datas.push(user_data);
         }
 
-        //TODO: is ron the best choice for passing around background data?
         ron::to_string(&user_datas).map_err(|err| GreeterError::Ron(err.to_string()))
     }
 }

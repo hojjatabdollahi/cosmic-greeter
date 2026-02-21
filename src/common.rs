@@ -1,19 +1,21 @@
 use cosmic::{
     app::{Core, Task},
     iced::{
-        self, Rectangle, Size, Subscription,
+        self,
         core::SmolStr,
         event::{
             self,
             wayland::{Event as WaylandEvent, OutputEvent, SessionLockEvent},
         },
         keyboard::{Event as KeyEvent, Key, Modifiers},
+        Rectangle, Size, Subscription,
     },
     iced_runtime::core::window::Id as SurfaceId,
     widget,
 };
+use cosmic_bg_lib::{BackgroundHandle, EngineConfig, UserContext};
 use cosmic_config::{ConfigSet, CosmicConfigEntry};
-use cosmic_greeter_daemon::{BgSource, CosmicCompConfig, UserData};
+use cosmic_greeter_daemon::{CosmicCompConfig, UserData};
 use std::{collections::HashMap, sync::Arc};
 use wayland_client::protocol::wl_output::WlOutput;
 
@@ -33,7 +35,6 @@ pub struct Common<M> {
     pub comp_config_handler: Option<cosmic_config::Config>,
     pub core: Core,
     pub error_opt: Option<String>,
-    pub fallback_background: widget::image::Handle,
     pub layouts_opt: Option<Arc<xkb_data::KeyboardLayouts>>,
     pub network_icon_opt: Option<widget::Icon>,
     pub on_output_event: Option<Box<dyn Fn(OutputEvent, WlOutput) -> M>>,
@@ -43,7 +44,6 @@ pub struct Common<M> {
     pub prompt_opt: Option<(String, bool, Option<String>)>,
     pub subsurface_rects: HashMap<WlOutput, Rectangle>,
     pub surface_ids: HashMap<WlOutput, SurfaceId>,
-    pub surface_images: HashMap<SurfaceId, widget::image::Handle>,
     pub surface_names: HashMap<SurfaceId, String>,
     pub text_input_ids: HashMap<String, widget::Id>,
     pub time: crate::time::Time,
@@ -100,9 +100,6 @@ impl<M: From<Message> + Send + 'static> Common<M> {
             comp_config_handler,
             core,
             error_opt: None,
-            fallback_background: widget::image::Handle::from_bytes(
-                include_bytes!("../res/background.jpg").as_slice(),
-            ),
             layouts_opt,
             network_icon_opt: None,
             on_output_event: None,
@@ -112,7 +109,6 @@ impl<M: From<Message> + Send + 'static> Common<M> {
             prompt_opt: None,
             subsurface_rects: HashMap::new(),
             surface_ids: HashMap::new(),
-            surface_images: HashMap::new(),
             surface_names: HashMap::new(),
             text_input_ids: HashMap::new(),
             time: crate::time::Time::new(),
@@ -148,55 +144,7 @@ impl<M: From<Message> + Send + 'static> Common<M> {
         }
     }
 
-    pub fn update_wallpapers(&mut self, user_data: &UserData) {
-        for (_output, surface_id) in self.surface_ids.iter() {
-            if self.surface_images.contains_key(surface_id) {
-                continue;
-            }
-
-            let Some(output_name) = self.surface_names.get(surface_id) else {
-                continue;
-            };
-
-            tracing::info!("updating wallpaper for {:?}", output_name);
-
-            for (wallpaper_output_name, wallpaper_source) in user_data.bg_state.wallpapers.iter() {
-                if wallpaper_output_name == output_name {
-                    match wallpaper_source {
-                        BgSource::Path(path) => {
-                            match user_data.bg_path_data.get(path) {
-                                Some(bytes) => {
-                                    let image = widget::image::Handle::from_bytes(bytes.clone());
-                                    self.surface_images.insert(*surface_id, image);
-                                    //TODO: what to do about duplicates?
-                                }
-                                None => {
-                                    tracing::warn!(
-                                        "output {}: failed to find wallpaper data for source {:?}",
-                                        output_name,
-                                        path
-                                    );
-                                }
-                            }
-                            break;
-                        }
-                        BgSource::Color(color) => {
-                            //TODO: support color sources
-                            tracing::warn!(
-                                "output {}: unsupported source {:?}",
-                                output_name,
-                                color
-                            );
-                        }
-                    }
-                }
-            }
-        }
-    }
-
     pub fn update_user_data(&mut self, user_data: &UserData) {
-        self.update_wallpapers(user_data);
-
         // From cosmic-applet-input-sources
         if let Some(keyboard_layouts) = &self.layouts_opt {
             if let Some(xkb_config) = &user_data.xkb_config_opt {
@@ -368,5 +316,135 @@ impl<M: From<Message> + Send + 'static> Common<M> {
         }
 
         Subscription::batch(subscriptions)
+    }
+}
+
+pub trait EngineHandle {
+    fn start(&mut self, user: UserContext);
+    fn stop(&mut self);
+}
+
+#[derive(Default)]
+pub struct CosmicBackgroundEngine {
+    handle: Option<BackgroundHandle>,
+}
+
+impl EngineHandle for CosmicBackgroundEngine {
+    fn start(&mut self, user: UserContext) {
+        self.handle = Some(BackgroundHandle::spawn(user, EngineConfig::default()));
+    }
+
+    fn stop(&mut self) {
+        if let Some(mut handle) = self.handle.take() {
+            handle.stop();
+        }
+    }
+}
+
+pub struct BackgroundController<E: EngineHandle> {
+    engine: E,
+    last_user: Option<UserContext>,
+}
+
+impl<E: EngineHandle> BackgroundController<E> {
+    pub fn new(engine: E) -> Self {
+        Self {
+            engine,
+            last_user: None,
+        }
+    }
+
+    pub fn set_user(&mut self, user: UserContext) {
+        if self.last_user.as_ref() == Some(&user) {
+            return;
+        }
+
+        self.engine.stop();
+        self.engine.start(user.clone());
+        self.last_user = Some(user);
+    }
+
+    pub fn clear_user(&mut self) {
+        if self.last_user.is_none() {
+            return;
+        }
+
+        self.engine.stop();
+        self.last_user = None;
+    }
+
+    pub fn has_active_user(&self) -> bool {
+        self.last_user.is_some()
+    }
+}
+
+impl<E: EngineHandle> Drop for BackgroundController<E> {
+    fn drop(&mut self) {
+        self.engine.stop();
+    }
+}
+
+pub fn user_context_from_user_data(user_data: &UserData) -> UserContext {
+    let home_dir = &user_data.home_dir;
+    let home = home_dir.to_string_lossy().to_string();
+    let config_home = home_dir.join(".config").to_string_lossy().to_string();
+    let state_home = home_dir.join(".local/state").to_string_lossy().to_string();
+    let cache_home = home_dir.join(".cache").to_string_lossy().to_string();
+    let data_home = home_dir.join(".local/share").to_string_lossy().to_string();
+
+    UserContext::new([
+        ("HOME", home),
+        ("XDG_CONFIG_HOME", config_home),
+        ("XDG_STATE_HOME", state_home),
+        ("XDG_CACHE_HOME", cache_home),
+        ("XDG_DATA_HOME", data_home),
+    ])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Default)]
+    struct MockEngine {
+        start_calls: Arc<std::sync::atomic::AtomicUsize>,
+        stop_calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl EngineHandle for MockEngine {
+        fn start(&mut self, _user: UserContext) {
+            self.start_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        fn stop(&mut self) {
+            self.stop_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn background_controller_updates_user() {
+        let start_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let stop_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut controller = BackgroundController::new(MockEngine {
+            start_calls: start_calls.clone(),
+            stop_calls: stop_calls.clone(),
+        });
+        controller.set_user(UserContext::new([("HOME", "/tmp")]));
+        assert!(controller.last_user.is_some());
+        assert_eq!(start_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(stop_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        controller.set_user(UserContext::new([("HOME", "/tmp")]));
+        assert_eq!(start_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(stop_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        controller.set_user(UserContext::new([("HOME", "/var")]));
+        assert_eq!(start_calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(stop_calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+
+        drop(controller);
+        assert_eq!(stop_calls.load(std::sync::atomic::Ordering::SeqCst), 3);
     }
 }

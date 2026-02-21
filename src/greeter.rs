@@ -36,6 +36,13 @@ use cosmic::{
     desktop::fde::{DesktopEntry, get_languages_from_env},
     surface,
 };
+use cosmic::iced::time::Instant as IcedInstant;
+use cosmic::iced_widget::shader::Shader;
+use cosmic_bg_config::{Entry as BackgroundEntry, Source as BackgroundSource, Color as BgColor};
+use cosmic_bg_lib::{BackgroundHandle, EngineConfig, UserContext};
+use image::DynamicImage;
+
+use crate::background_shader::BackgroundShaderProgram;
 use cosmic_comp_config::output::randr::{CurrentOutput, get_matching_config};
 use cosmic_greeter_config::Config as CosmicGreeterConfig;
 use cosmic_greeter_daemon::UserData;
@@ -89,6 +96,106 @@ async fn user_data_dbus() -> Result<Vec<UserData>, Box<dyn Error>> {
 
     let user_datas: Vec<UserData> = ron::from_str(&reply)?;
     Ok(user_datas)
+}
+
+fn load_background_from_entry(entry: &BackgroundEntry, width: u32, height: u32) -> Option<widget::image::Handle> {
+    match &entry.source {
+        BackgroundSource::Path(path) => {
+            let img_path = if path.is_dir() {
+                // Find first image in directory
+                let mut images: Vec<_> = std::fs::read_dir(path)
+                    .ok()?
+                    .filter_map(|e| e.ok())
+                    .map(|e| e.path())
+                    .filter(|p| {
+                        p.extension()
+                            .map(|ext| {
+                                let ext = ext.to_str().unwrap_or("").to_lowercase();
+                                matches!(ext.as_str(), "jpg" | "jpeg" | "png" | "webp" | "gif" | "bmp")
+                            })
+                            .unwrap_or(false)
+                    })
+                    .collect();
+                images.sort();
+                images.into_iter().next()?
+            } else {
+                path.clone()
+            };
+
+            tracing::warn!("BG_DEBUG: Loading wallpaper image from {:?}", img_path);
+            let img = image::open(&img_path).ok()?;
+            // Scale to fit
+            let scaled = img.resize_to_fill(width, height, image::imageops::FilterType::Lanczos3);
+            let rgba = scaled.to_rgba8();
+            let w = rgba.width();
+            let h = rgba.height();
+            Some(widget::image::Handle::from_rgba(w, h, rgba.into_raw()))
+        }
+        BackgroundSource::Color(color) => {
+            tracing::warn!("BG_DEBUG: Creating solid color/gradient background");
+            let img = match color {
+                BgColor::Single(rgb) => {
+                    // Create solid color image
+                    let r = (rgb[0] * 255.0) as u8;
+                    let g = (rgb[1] * 255.0) as u8;
+                    let b = (rgb[2] * 255.0) as u8;
+                    DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+                        width, height,
+                        image::Rgba([r, g, b, 255])
+                    ))
+                }
+                BgColor::Gradient(gradient) => {
+                    // Create gradient image (simplified - radial gradient from center)
+                    let mut img = image::RgbaImage::new(width, height);
+                    let cx = width as f32 / 2.0;
+                    let cy = height as f32 / 2.0;
+                    let max_dist = (cx * cx + cy * cy).sqrt() * gradient.radius;
+                    
+                    for (x, y, pixel) in img.enumerate_pixels_mut() {
+                        let dx = x as f32 - cx;
+                        let dy = y as f32 - cy;
+                        let dist = (dx * dx + dy * dy).sqrt();
+                        let t = (dist / max_dist).min(1.0);
+                        
+                        // Interpolate between gradient colors
+                        let colors = &gradient.colors;
+                        if colors.is_empty() {
+                            *pixel = image::Rgba([0, 0, 0, 255]);
+                        } else if colors.len() == 1 {
+                            let c = colors[0];
+                            *pixel = image::Rgba([
+                                (c[0] * 255.0) as u8,
+                                (c[1] * 255.0) as u8,
+                                (c[2] * 255.0) as u8,
+                                255
+                            ]);
+                        } else {
+                            let idx = t * (colors.len() - 1) as f32;
+                            let i = idx.floor() as usize;
+                            let frac = idx - i as f32;
+                            let c1 = colors[i.min(colors.len() - 1)];
+                            let c2 = colors[(i + 1).min(colors.len() - 1)];
+                            *pixel = image::Rgba([
+                                ((c1[0] * (1.0 - frac) + c2[0] * frac) * 255.0) as u8,
+                                ((c1[1] * (1.0 - frac) + c2[1] * frac) * 255.0) as u8,
+                                ((c1[2] * (1.0 - frac) + c2[2] * frac) * 255.0) as u8,
+                                255
+                            ]);
+                        }
+                    }
+                    DynamicImage::ImageRgba8(img)
+                }
+            };
+            let rgba = img.to_rgba8();
+            let w = rgba.width();
+            let h = rgba.height();
+            Some(widget::image::Handle::from_rgba(w, h, rgba.into_raw()))
+        }
+        BackgroundSource::Shader(_) => {
+            // Shaders are handled separately
+            None
+        }
+    }
 }
 
 fn user_data_fallback() -> Vec<UserData> {
@@ -417,6 +524,8 @@ pub enum Message {
     InvertColors(bool),
     WaylandUpdate(WaylandUpdate),
     SpinnerTick,
+    /// Frame tick for shader animation.
+    Tick(IcedInstant),
 }
 
 impl From<common::Message> for Message {
@@ -428,6 +537,14 @@ impl From<common::Message> for Message {
 /// The [`App`] stores application-specific state.
 pub struct App {
     common: Common<Message>,
+    background_controller: common::BackgroundController<common::CosmicBackgroundEngine>,
+    fallback_background: Option<BackgroundHandle>,
+    /// Shader program for animated shader backgrounds.
+    /// Uses iced's shader widget for direct GPU rendering.
+    shader_program: Option<BackgroundShaderProgram>,
+    /// Static background image for non-shader wallpapers.
+    /// Loaded from the user's config via the daemon.
+    static_background: Option<widget::image::Handle>,
     flags: Flags,
     greetd_sender: Option<tokio::sync::mpsc::Sender<greetd_ipc::Request>>,
     socket_state: SocketState,
@@ -1047,7 +1164,67 @@ impl App {
         self.common.set_xkb_config(user_data);
     }
 
+    fn update_background_for_selected_user(&mut self) {
+        let user_data = self.selected_username.data_idx.and_then(|i| {
+            self.flags.user_datas.get(i)
+        });
+
+        // First, try to use shader source from UserData (loaded by daemon)
+        self.shader_program = user_data.and_then(|ud| {
+            ud.shader_source.as_ref().and_then(|source| {
+                tracing::warn!(
+                    "SHADER_DEBUG: using shader source from daemon for user {}: {:?}",
+                    ud.name,
+                    source
+                );
+                let program = BackgroundShaderProgram::new(source);
+                tracing::warn!(
+                    "SHADER_DEBUG: shader program created: {}",
+                    program.is_some()
+                );
+                program
+            })
+        });
+
+        // If we have a shader program, we render it directly in view_window.
+        // Otherwise, try to load static background from the daemon's background_entry.
+        // We don't use background_controller anymore because it can't read user configs.
+        if self.shader_program.is_some() {
+            tracing::warn!("BG_DEBUG: Using shader widget, clearing static background");
+            self.static_background = None;
+            self.background_controller.clear_user();
+            self.fallback_background = None;
+        } else if let Some(entry) = user_data.and_then(|ud| ud.background_entry.as_ref()) {
+            tracing::warn!("BG_DEBUG: Loading static background from daemon-provided entry: {:?}", entry.source);
+            // Load the background image from the entry (daemon already read the config)
+            self.static_background = load_background_from_entry(entry, 1920, 1080);
+            tracing::warn!("BG_DEBUG: Static background loaded: {}", self.static_background.is_some());
+            self.background_controller.clear_user();
+            self.fallback_background = None;
+        } else {
+            tracing::warn!("BG_DEBUG: No shader and no background entry, using fallback");
+            self.static_background = None;
+            self.background_controller.clear_user();
+            if self.fallback_background.is_none() {
+                self.fallback_background = Some(BackgroundHandle::spawn(
+                    UserContext::new(Vec::<(&str, &str)>::new()),
+                    EngineConfig::default(),
+                ));
+            }
+        }
+
+        tracing::warn!(
+            "BG_DEBUG: Final state: shader={}, static_bg={}, fallback={}, user={:?}",
+            self.shader_program.is_some(),
+            self.static_background.is_some(),
+            self.fallback_background.is_some(),
+            user_data.map(|ud| &ud.name)
+        );
+    }
+
     fn update_user_data(&mut self) -> Task<Message> {
+        self.update_background_for_selected_user();
+
         let user_data = match self
             .selected_username
             .data_idx
@@ -1158,7 +1335,11 @@ impl cosmic::Application for App {
             })
             .or_else(|| session_names.first().cloned())
             .unwrap_or_default();
-        let data_idx = Some(0);
+        // Find the correct data_idx for the selected username
+        let data_idx = flags
+            .user_datas
+            .iter()
+            .position(|d| d.name == username);
         let selected_username = NameIndexPair { username, data_idx };
         let accessibility = Accessibility {
             helper: cosmic_settings_daemon_config::greeter::GreeterAccessibilityState::config()
@@ -1166,8 +1347,35 @@ impl cosmic::Application for App {
             ..Default::default()
         };
 
-        let app = App {
+        // Create shader program for the initially selected user
+        // Shader source is loaded by the daemon (which has root access to read user configs)
+        let shader_program = data_idx
+            .and_then(|idx| flags.user_datas.get(idx))
+            .and_then(|user_data| {
+                user_data.shader_source.as_ref().and_then(|source| {
+                    tracing::warn!(
+                        "SHADER_DEBUG: App::init: using shader from daemon for user {}: {:?}",
+                        user_data.name,
+                        source
+                    );
+                    BackgroundShaderProgram::new(source)
+                })
+            });
+        tracing::warn!(
+            "SHADER_DEBUG: App::init: shader_program = {}, selected_user = {:?}, data_idx = {:?}",
+            shader_program.is_some(),
+            selected_username.username,
+            data_idx
+        );
+
+        let mut app = App {
             common,
+            background_controller: common::BackgroundController::new(
+                common::CosmicBackgroundEngine::default(),
+            ),
+            fallback_background: None,
+            shader_program,
+            static_background: None,
             flags,
             greetd_sender: None,
             socket_state: SocketState::Pending,
@@ -1187,6 +1395,7 @@ impl cosmic::Application for App {
             spinner_rotation: 0.0,
             spinner_handle: None,
         };
+        app.update_background_for_selected_user();
         (app, Task::batch(tasks))
     }
 
@@ -1240,7 +1449,6 @@ impl cosmic::Application for App {
                                     self.common
                                         .surface_names
                                         .insert(subsurface_id, output_name.clone());
-                                    self.common.surface_images.remove(&surface_id);
                                     let text_input_id =
                                         widget::Id::new(format!("input-{output_name}",));
                                     self.common
@@ -1320,7 +1528,6 @@ impl cosmic::Application for App {
                         tracing::info!("output {}: removed", output.id());
                         match self.common.surface_ids.remove(&output) {
                             Some(surface_id) => {
-                                self.common.surface_images.remove(&surface_id);
                                 self.common.window_size.remove(&surface_id);
                                 if let Some(n) = self.common.surface_names.remove(&surface_id) {
                                     self.common.text_input_ids.remove(&n);
@@ -1385,7 +1592,7 @@ impl cosmic::Application for App {
                         .iter()
                         .position(|d| d.name == username);
                     self.selected_username = NameIndexPair { username, data_idx };
-                    self.common.surface_images.clear();
+                    self.update_background_for_selected_user();
                     if let Some(session) = data_idx.and_then(|i| {
                         self.flags
                             .user_datas
@@ -1650,7 +1857,6 @@ impl cosmic::Application for App {
             Message::Exit => {
                 let mut commands = Vec::new();
                 for (_output, surface_id) in self.common.surface_ids.drain() {
-                    self.common.surface_images.remove(&surface_id);
                     self.common.surface_names.remove(&surface_id);
                     if let Some(n) = self.common.surface_names.remove(&surface_id) {
                         self.common.text_input_ids.remove(&n);
@@ -1851,6 +2057,10 @@ impl cosmic::Application for App {
                 // Update spinner rotation angle (360 degrees per second = 6 degrees per frame at 60fps)
                 self.spinner_rotation = (self.spinner_rotation + 6.0) % 360.0;
             }
+            Message::Tick(_instant) => {
+                // Shader animation tick - no action needed here.
+                // The shader widget will automatically use updated time from start_time.elapsed()
+            }
         }
         Task::none()
     }
@@ -1861,21 +2071,36 @@ impl cosmic::Application for App {
     }
 
     /// Creates a view after each update.
-    fn view_window(&self, surface_id: SurfaceId) -> Element<Self::Message> {
-        let img = self
-            .common
-            .surface_images
-            .get(&surface_id)
-            .unwrap_or(&self.common.fallback_background);
-        widget::image(img)
-            .content_fit(iced::ContentFit::Cover)
+    fn view_window(&self, _surface_id: SurfaceId) -> Element<Self::Message> {
+        // Priority: shader > static background > transparent (for fallback cosmic-bg)
+        if let Some(ref program) = self.shader_program {
+            Shader::new(program)
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .into()
+        } else if let Some(ref handle) = self.static_background {
+            // Render static wallpaper image
+            widget::container(
+                widget::image(handle.clone())
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+                    .content_fit(cosmic::iced_core::ContentFit::Cover)
+            )
             .width(Length::Fill)
             .height(Length::Fill)
             .into()
+        } else {
+            // Transparent to let cosmic-bg fallback show through
+            widget::container(widget::Space::new(Length::Fill, Length::Fill))
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .class(cosmic::theme::Container::Transparent)
+                .into()
+        }
     }
 
     fn subscription(&self) -> Subscription<Self::Message> {
-        Subscription::batch([
+        let mut subscriptions = vec![
             self.common.subscription().map(Message::from),
             ipc::subscription(),
             wayland::a11y_subscription().map(Message::WaylandUpdate),
@@ -1886,7 +2111,14 @@ impl cosmic::Application for App {
                 }
                 _ => None,
             }),
-        ])
+        ];
+
+        // shader animatino subscription
+        if self.shader_program.is_some() {
+            subscriptions.push(window::frames().map(|(_, instant)| Message::Tick(instant)));
+        }
+
+        Subscription::batch(subscriptions)
     }
 }
 

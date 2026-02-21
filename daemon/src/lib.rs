@@ -1,12 +1,11 @@
 use cosmic_config::CosmicConfigEntry;
 use std::{
-    collections::BTreeMap,
     fs,
     path::{Path, PathBuf},
 };
 
 pub use cosmic_applets_config::time::TimeAppletConfig;
-pub use cosmic_bg_config::{Color, Source as BgSource, state::State as BgState};
+pub use cosmic_bg_config::{Entry as BackgroundEntry, ShaderSource, Source as BackgroundSource};
 pub use cosmic_comp_config::{CosmicCompConfig, XkbConfig, ZoomConfig};
 pub use cosmic_theme::{Theme, ThemeBuilder};
 
@@ -15,58 +14,28 @@ pub struct UserData {
     pub uid: u32,
     pub name: String,
     pub full_name: String,
+    pub home_dir: PathBuf,
     pub icon_opt: Option<Vec<u8>>,
     pub theme_opt: Option<Theme>,
     pub theme_builder_opt: Option<ThemeBuilder>,
-    pub bg_state: BgState,
-    pub bg_path_data: BTreeMap<PathBuf, Vec<u8>>,
     pub xkb_config_opt: Option<XkbConfig>,
     pub time_applet_config: TimeAppletConfig,
     pub accessibility_zoom: ZoomConfig,
     /// Path to the user's outputs.ron config file
     pub output_config_path: Option<PathBuf>,
+    pub shader_source: Option<ShaderSource>,
+    pub background_entry: Option<BackgroundEntry>,
 }
 
 impl UserData {
-    pub fn load_wallpapers_as_user(&mut self) {
-        //TODO: reload changed background files?
-        self.bg_path_data.retain(|path, _| {
-            self.bg_state
-                .wallpapers
-                .iter()
-                .any(|(_, source)| match source {
-                    BgSource::Path(source_path) => source_path == path,
-                    _ => false,
-                })
-        });
-        for (_, source) in self.bg_state.wallpapers.iter() {
-            match source {
-                //TODO: do not reread duplicate paths, cache data by path?
-                BgSource::Path(path) => {
-                    if !self.bg_path_data.contains_key(path) {
-                        match fs::read(path) {
-                            Ok(bytes) => {
-                                self.bg_path_data.insert(path.clone(), bytes);
-                            }
-                            Err(err) => {
-                                tracing::error!("failed to read wallpaper {:?}: {:?}", path, err);
-                            }
-                        }
-                    }
-                }
-                // Other types not supported
-                _ => {}
-            }
-        }
-    }
-
     pub fn load_config_as_user(&mut self) {
         self.icon_opt = None;
         self.theme_opt = None;
         self.theme_builder_opt = None;
-        self.bg_state = Default::default();
         self.xkb_config_opt = None;
         self.time_applet_config = Default::default();
+        self.shader_source = None;
+        self.background_entry = None;
 
         //TODO: use accountsservice?
         //IMPORTANT: This file is owned by root and safe to read (it won't be a link to /etc/shadow for example)
@@ -141,23 +110,6 @@ impl UserData {
             }
         }
 
-        //TODO: fallback to background config if background state is not set?
-        match cosmic_bg_config::state::State::state() {
-            Ok(helper) => match cosmic_bg_config::state::State::get_entry(&helper) {
-                Ok(state) => {
-                    self.bg_state = state;
-                }
-                Err((errs, state)) => {
-                    tracing::error!("failed to load cosmic-bg state: {:?}", errs);
-                    self.bg_state = state;
-                }
-            },
-            Err(err) => {
-                tracing::error!("failed to create cosmic-bg state helper: {:?}", err);
-            }
-        }
-        self.load_wallpapers_as_user();
-
         match cosmic_config::Config::new("com.system76.CosmicComp", CosmicCompConfig::VERSION) {
             Ok(config_handler) => {
                 match CosmicCompConfig::get_entry(&config_handler) {
@@ -201,6 +153,73 @@ impl UserData {
                 );
             }
         };
+
+        let home_env = std::env::var("HOME").unwrap_or_else(|_| "UNSET".to_string());
+        let xdg_config = std::env::var("XDG_CONFIG_HOME").unwrap_or_else(|_| "UNSET".to_string());
+        let expected_config_path = self
+            .home_dir
+            .join(".config/cosmic/com.system76.CosmicBackground/v1/all");
+        tracing::warn!(
+            "BG_DAEMON: loading bg config for user {} (HOME={}, XDG_CONFIG_HOME={}, expected_path={})",
+            self.name, home_env, xdg_config, expected_config_path.display()
+        );
+        match cosmic_bg_config::context() {
+            Ok(ctx) => {
+                // Log the actual config path being used
+                let ctx_path = format!("{:?}", ctx);
+                tracing::warn!(
+                    "BG_DAEMON: bg config context created for user {}, context={:?}",
+                    self.name,
+                    ctx_path
+                );
+                match cosmic_bg_config::Config::load(&ctx) {
+                    Ok(config) => {
+                        let source_type = match &config.default_background.source {
+                            cosmic_bg_config::Source::Shader(_) => "Shader",
+                            cosmic_bg_config::Source::Path(_) => "Path",
+                            cosmic_bg_config::Source::Color(_) => "Color",
+                        };
+                        tracing::warn!(
+                            "BG_DAEMON: bg config loaded for user {}, source type = {}",
+                            self.name,
+                            source_type
+                        );
+
+                        if let cosmic_bg_config::Source::Shader(ref shader) =
+                            config.default_background.source
+                        {
+                            tracing::warn!(
+                                "BG_DAEMON: found shader source for user {}: {:?}",
+                                self.name,
+                                shader
+                            );
+                            self.shader_source = Some(shader.clone());
+                        }
+
+                        tracing::warn!(
+                            "BG_DAEMON: storing background entry for user {}: {:?}",
+                            self.name,
+                            config.default_background
+                        );
+                        self.background_entry = Some(config.default_background);
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            "BG_DAEMON: failed to load bg config for user {}: {:?}",
+                            self.name,
+                            err
+                        );
+                    }
+                }
+            }
+            Err(err) => {
+                tracing::warn!(
+                    "BG_DAEMON: failed to create bg config context for user {}: {:?}",
+                    self.name,
+                    err
+                );
+            }
+        }
     }
 }
 
@@ -219,6 +238,7 @@ impl From<pwd::Passwd> for UserData {
             uid: user.uid,
             name: user.name.clone(),
             full_name,
+            home_dir: PathBuf::from(&user.dir),
             ..Default::default()
         }
     }

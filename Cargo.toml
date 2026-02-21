@@ -8,12 +8,14 @@ vergen = { version = "8", features = ["git", "gitcl"] }
 
 [dependencies]
 anyhow = "1"
+bytemuck = "1"
 async-fn-stream = "0.3"
 icu = { version = "2.0.0", features = ["compiled_data"] }
 chrono-tz = "0.10"
 chrono = { version = "0.4", features = ["unstable-locales"] }
 cosmic-applets-config.workspace = true
 cosmic-bg-config.workspace = true
+cosmic-bg-lib = { path = "../cosmic-bg/crates/cosmic-bg-lib" }
 cosmic-comp-config.workspace = true
 cosmic-config = { workspace = true, features = ["calloop", "macro"] }
 cosmic-greeter-config.workspace = true
@@ -22,6 +24,7 @@ dirs = "6"
 libcosmic = { workspace = true, features = [
   "autosize",
   "winit",
+  "wgpu",
   "multi-window",
   "desktop",
   "wayland",
@@ -136,8 +139,8 @@ git = "https://github.com/pop-os/cosmic-bg"
 default-features = false
 
 [workspace.dependencies.cosmic-comp-config]
-# git = "https://github.com/pop-os/cosmic-comp"
-path = "../cosmic-comp/cosmic-comp-config/"
+git = "https://github.com/pop-os/cosmic-comp"
+# path = "../cosmic-comp/cosmic-comp-config/"
 default-features = false
 features = ["output", "randr"]
 
@@ -166,3 +169,10 @@ cctk = { git = "https://github.com/pop-os/cosmic-protocols//", package = "cosmic
 # libcosmic = { path = "../libcosmic" }
 # cosmic-config = { path = "../libcosmic/cosmic-config" }
 # cosmic-theme = { path = "../libcosmic/cosmic-theme" }
+[patch."https://github.com/pop-os/cosmic-comp"]
+# Local repo override pinned to a specific commit.
+cosmic-comp-config = { git = "file:///home/hojjat/Project/rust/cosmic-comp", rev = "40123fe4" }
+
+[patch."https://github.com/pop-os/cosmic-bg"]
+# Use local cosmic-bg for cosmic_bg_config to match cosmic-bg-lib
+cosmic-bg-config = { path = "../cosmic-bg/config" }

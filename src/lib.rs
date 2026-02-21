@@ -4,6 +4,7 @@
 pub mod greeter;
 pub mod locker;
 
+mod background_shader;
 mod wayland;
 
 mod common;

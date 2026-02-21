@@ -4,8 +4,11 @@
 use color_eyre::eyre::WrapErr;
 use cosmic::app::{Core, Settings, Task};
 use cosmic::cctk::wayland_protocols::xdg::shell::client::xdg_positioner::Gravity;
+use cosmic::iced::time::Instant;
+use cosmic::iced::window;
 use cosmic::iced::{Point, Rectangle, Size};
 use cosmic::iced_runtime::platform_specific::wayland::subsurface::SctkSubsurfaceSettings;
+use cosmic::iced_widget::shader::{self, Shader};
 use cosmic::surface;
 use cosmic::{
     Element, executor,
@@ -20,8 +23,13 @@ use cosmic::{
     iced_runtime::core::window::Id as SurfaceId,
     theme, widget,
 };
+use cosmic_bg_lib::{
+    load_background_image, load_shader_source,
+    BackgroundHandle, EngineConfig, UserContext,
+};
 use cosmic_config::CosmicConfigEntry;
 use cosmic_greeter_daemon::{TimeAppletConfig, UserData};
+use std::sync::Arc;
 use std::time::Duration;
 use std::{
     any::TypeId,
@@ -31,13 +39,14 @@ use std::{
     os::fd::OwnedFd,
     path::PathBuf,
     process,
-    sync::Arc,
 };
 use tokio::{sync::mpsc, task};
 use tracing::level_filters::LevelFilter;
 use tracing::warn;
 use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 use wayland_client::{Proxy, protocol::wl_output::WlOutput};
+
+use crate::background_shader::BackgroundShaderProgram;
 
 use crate::{
     common::{self, Common, DEFAULT_MENU_ITEM_HEIGHT},
@@ -48,6 +57,30 @@ fn lockfile_opt() -> Option<PathBuf> {
     let runtime_dir = dirs::runtime_dir()?;
     let session_id = env::var("XDG_SESSION_ID").ok()?;
     Some(runtime_dir.join(format!("cosmic-greeter-{}.lock", session_id)))
+}
+
+fn load_lock_surface_background(
+    user_context: &UserContext,
+) -> Option<widget::image::Handle> {
+    const DEFAULT_WIDTH: u32 = 1920;
+    const DEFAULT_HEIGHT: u32 = 1080;
+
+    if let Some(img) = load_background_image(user_context, DEFAULT_WIDTH, DEFAULT_HEIGHT) {
+        // Convert to RGBA bytes for iced
+        let rgba = img.to_rgba8();
+        let width = rgba.width();
+        let height = rgba.height();
+        let bytes = rgba.into_raw();
+        return Some(widget::image::Handle::from_rgba(width, height, bytes));
+    }
+
+    None
+}
+
+fn create_shader_program(user_context: &UserContext) -> Option<BackgroundShaderProgram> {
+    let shader_source = load_shader_source(user_context)?;
+    tracing::info!("Creating shader program for lock screen background");
+    BackgroundShaderProgram::new(&shader_source)
 }
 
 pub fn main(user: pwd::Passwd) -> Result<(), Box<dyn std::error::Error>> {
@@ -273,7 +306,6 @@ pub enum Message {
     OutputEvent(OutputEvent, WlOutput),
     SessionLockEvent(SessionLockEvent),
     Channel(mpsc::Sender<String>),
-    BackgroundState(cosmic_bg_config::state::State),
     DropdownToggle(Dropdown),
     KeyboardLayout(usize),
     Inhibit(Arc<OwnedFd>),
@@ -285,6 +317,8 @@ pub enum Message {
     Lock,
     Unlock,
     SpinnerTick,
+    /// shader animation
+    Tick(Instant),
 }
 
 impl From<common::Message> for Message {
@@ -316,6 +350,11 @@ impl Drop for State {
 /// The [`App`] stores application-specific state.
 pub struct App {
     common: Common<Message>,
+    background_controller: common::BackgroundController<common::CosmicBackgroundEngine>,
+    fallback_background: Option<BackgroundHandle>,
+    lock_surface_background: Option<widget::image::Handle>,
+    shader_program: Option<BackgroundShaderProgram>,
+    last_tick: Instant,
     flags: Flags,
     state: State,
     dropdown_opt: Option<Dropdown>,
@@ -668,8 +707,19 @@ impl cosmic::Application for App {
             None => false,
         };
 
+        let user_context = common::user_context_from_user_data(&flags.user_data);
+        let lock_surface_background = load_lock_surface_background(&user_context);
+        let shader_program = create_shader_program(&user_context);
+
         let mut app = App {
             common,
+            background_controller: common::BackgroundController::new(
+                common::CosmicBackgroundEngine::default(),
+            ),
+            fallback_background: None,
+            lock_surface_background,
+            shader_program,
+            last_tick: Instant::now(),
             flags,
             state: State::Unlocked,
             dropdown_opt: None,
@@ -679,6 +729,14 @@ impl cosmic::Application for App {
             spinner_rotation: 0.0,
             spinner_handle: None,
         };
+
+        app.background_controller.set_user(user_context.clone());
+        if !app.background_controller.has_active_user() {
+            app.fallback_background = Some(BackgroundHandle::spawn(
+                UserContext::new(Vec::<(&str, &str)>::new()),
+                EngineConfig::default(),
+            ));
+        }
 
         let task = if cfg!(feature = "logind") {
             if already_locked {
@@ -746,8 +804,6 @@ impl cosmic::Application for App {
                                     self.common
                                         .surface_names
                                         .insert(subsurface_id, output_name.clone());
-                                    self.common.surface_images.remove(&surface_id);
-                                    self.common.update_wallpapers(&self.flags.user_data);
                                     let text_input_id =
                                         widget::Id::new(format!("input-{output_name}",));
                                     self.common
@@ -816,7 +872,6 @@ impl cosmic::Application for App {
                         tracing::info!("output {}: removed", output.id());
                         match self.common.surface_ids.remove(&output) {
                             Some(surface_id) => {
-                                self.common.surface_images.remove(&surface_id);
                                 self.common.surface_names.remove(&surface_id);
                                 self.common.window_size.remove(&surface_id);
                                 if let Some(n) = self.common.surface_names.remove(&surface_id) {
@@ -1009,12 +1064,6 @@ impl cosmic::Application for App {
             Message::Channel(value_tx) => {
                 self.value_tx_opt = Some(value_tx);
             }
-            Message::BackgroundState(bg_state) => {
-                self.flags.user_data.bg_state = bg_state;
-                self.flags.user_data.load_wallpapers_as_user();
-                self.common.surface_images.clear();
-                self.common.update_wallpapers(&self.flags.user_data);
-            }
             Message::DropdownToggle(dropdown) => {
                 if self.dropdown_opt == Some(dropdown) {
                     self.dropdown_opt = None;
@@ -1104,6 +1153,13 @@ impl cosmic::Application for App {
                 // Update spinner rotation angle (360 degrees per second = 6 degrees per frame at 60fps)
                 self.spinner_rotation = (self.spinner_rotation + 6.0) % 360.0;
             }
+            Message::Tick(now) => {
+                // 60fps
+                const MIN_FRAME_TIME: Duration = Duration::from_micros(16_667); // ~60fps
+                if now.duration_since(self.last_tick) >= MIN_FRAME_TIME {
+                    self.last_tick = now;
+                }
+            }
             Message::Lock => match self.state {
                 State::Unlocked => {
                     tracing::info!("session locking");
@@ -1118,6 +1174,16 @@ impl cosmic::Application for App {
                         handle.abort();
                     }
                     self.spinner_rotation = 0.0;
+
+                    let user_context = common::user_context_from_user_data(&self.flags.user_data);
+                    self.lock_surface_background = load_lock_surface_background(&user_context);
+                    self.shader_program = create_shader_program(&user_context);
+                    tracing::info!(
+                        "Reloaded background config: shader={}, static_bg={}",
+                        self.shader_program.is_some(),
+                        self.lock_surface_background.is_some()
+                    );
+
                     // Try to create lockfile when locking
                     if let Some(ref lockfile) = self.flags.lockfile_opt {
                         if let Err(err) = fs::File::create(lockfile) {
@@ -1196,38 +1262,37 @@ impl cosmic::Application for App {
     }
 
     /// Creates a view after each update.
-    fn view_window(&self, surface_id: SurfaceId) -> Element<Self::Message> {
-        let img = self
-            .common
-            .surface_images
-            .get(&surface_id)
-            .unwrap_or(&self.common.fallback_background);
-        widget::image(img)
-            .content_fit(iced::ContentFit::Cover)
+    fn view_window(&self, _surface_id: SurfaceId) -> Element<Self::Message> {
+        // priority: shader > image > color
+        if let Some(ref program) = self.shader_program {
+            tracing::debug!("Using shader widget for lock screen background");
+            Shader::new(program)
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .into()
+        } else if let Some(ref bg_handle) = self.lock_surface_background {
+            widget::container(
+                widget::image(bg_handle)
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+                    .content_fit(iced::ContentFit::Cover),
+            )
             .width(Length::Fill)
             .height(Length::Fill)
             .into()
+        } else {
+            widget::container(widget::Space::new(Length::Fill, Length::Fill))
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .class(cosmic::theme::Container::Background)
+                .into()
+        }
     }
 
     fn subscription(&self) -> Subscription<Self::Message> {
-        let mut subscriptions = Vec::with_capacity(7);
+        let mut subscriptions = Vec::with_capacity(8);
 
         subscriptions.push(self.common.subscription().map(Message::from));
-
-        struct BackgroundSubscription;
-        subscriptions.push(
-            cosmic_config::config_state_subscription(
-                TypeId::of::<BackgroundSubscription>(),
-                cosmic_bg_config::NAME.into(),
-                cosmic_bg_config::state::State::version(),
-            )
-            .map(|res| {
-                if !res.errors.is_empty() {
-                    tracing::info!("errors loading background state: {:?}", res.errors);
-                }
-                Message::BackgroundState(res.config)
-            }),
-        );
 
         struct TimeAppletSubscription;
         subscriptions.push(
@@ -1243,6 +1308,10 @@ impl cosmic::Application for App {
                 Message::TimeAppletConfig(res.config)
             }),
         );
+
+        if self.shader_program.is_some() {
+            subscriptions.push(window::frames().map(|(_, instant)| Message::Tick(instant)));
+        }
 
         #[cfg(feature = "logind")]
         {
