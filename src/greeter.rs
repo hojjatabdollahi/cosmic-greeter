@@ -1256,9 +1256,9 @@ impl cosmic::Application for App {
                         let unwrapped_size = size
                             .map(|s| (s.0.unwrap_or(1920), s.1.unwrap_or(1080)))
                             .unwrap_or((1920, 1080));
-                        let loc = Point::new(0., 32.);
+                        let loc = Point::ORIGIN;
                         let sub_size =
-                            Size::new(unwrapped_size.0 as f32, unwrapped_size.1 as f32 - 32.);
+                            Size::new(unwrapped_size.0 as f32, unwrapped_size.1 as f32);
                         self.common.window_size.insert(
                             surface_id,
                             Size::new(unwrapped_size.0 as f32, unwrapped_size.1 as f32),
@@ -1856,7 +1856,7 @@ impl cosmic::Application for App {
                     tracing::error!("Failed to find subsurface menu id");
                     return Task::none();
                 };
-                return reposition_subsurface(*subsurface_id, 0, 32);
+                return reposition_subsurface(*subsurface_id, 0, 0);
             }
             Message::SpinnerTick => {
                 // Update spinner rotation angle (360 degrees per second = 6 degrees per frame at 60fps)
