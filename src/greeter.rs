@@ -586,7 +586,9 @@ impl App {
                         Message::KeyboardLayout(i),
                     ));
                 }
-                input_button = input_button.popup(dropdown_menu(items));
+                input_button = input_button
+                    .popup(dropdown_menu(items))
+                    .on_close(Message::DropdownToggle(Dropdown::Keyboard));
             }
 
             let mut user_button = widget::popover(
@@ -626,7 +628,9 @@ impl App {
                     dropdown_menu(items)
                 };
 
-                user_button = user_button.popup(items);
+                user_button = user_button
+                    .popup(items)
+                    .on_close(Message::DropdownToggle(Dropdown::User));
             }
 
             let mut session_button = widget::popover(
@@ -644,7 +648,9 @@ impl App {
                         Message::Session(session_name.clone()),
                     ));
                 }
-                session_button = session_button.popup(dropdown_menu(items));
+                session_button = session_button
+                    .popup(dropdown_menu(items))
+                    .on_close(Message::DropdownToggle(Dropdown::Session));
             }
 
             // Accessibility menu as a popup dialog
@@ -679,7 +685,9 @@ impl App {
                     self.accessibility.invert_colors,
                     Message::InvertColors(!self.accessibility.invert_colors),
                 ));
-                accessibility_dropdown = accessibility_dropdown.popup(dropdown_menu(items));
+                accessibility_dropdown = accessibility_dropdown
+                    .popup(dropdown_menu(items))
+                    .on_close(Message::DropdownToggle(Dropdown::Accessibility));
             }
 
             let accessibility_button = accessibility_dropdown;

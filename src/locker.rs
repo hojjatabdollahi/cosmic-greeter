@@ -421,7 +421,9 @@ impl App {
                         Message::KeyboardLayout(i),
                     ));
                 }
-                input_button = input_button.popup(dropdown_menu(items));
+                input_button = input_button
+                    .popup(dropdown_menu(items))
+                    .on_close(Message::DropdownToggle(Dropdown::Keyboard));
             }
 
             //TODO: implement these buttons
