@@ -767,17 +767,9 @@ impl cosmic::Application for App {
                         let unwrapped_size = size
                             .map(|s| (s.0.unwrap_or(1920), s.1.unwrap_or(1080)))
                             .unwrap_or((1920, 1080));
-                        let (loc, sub_size) = if unwrapped_size.0 > 800 {
-                            (
-                                Point::new(unwrapped_size.0 as f32 / 2. - 400., 32.),
-                                Size::new(800., unwrapped_size.1 as f32 - 32.),
-                            )
-                        } else {
-                            (
-                                Point::new(0., 32.),
-                                Size::new(unwrapped_size.0 as f32, unwrapped_size.1 as f32 - 32.),
-                            )
-                        };
+                        let loc = Point::new(0., 32.);
+                        let sub_size =
+                            Size::new(unwrapped_size.0 as f32, unwrapped_size.1 as f32 - 32.);
                         self.common.window_size.insert(
                             surface_id,
                             Size::new(unwrapped_size.0 as f32, unwrapped_size.1 as f32),
@@ -840,14 +832,9 @@ impl cosmic::Application for App {
                         let unwrapped_size = size
                             .map(|s| (s.0.unwrap_or(1920), s.1.unwrap_or(1080)))
                             .unwrap_or((1920, 1080));
-                        let (loc, sub_size) = if unwrapped_size.0 > 800 {
-                            (
-                                Point::new(unwrapped_size.0 as f32 / 2. - 400., 32.),
-                                Size::new(800., unwrapped_size.1 as f32 - 32.),
-                            )
-                        } else {
-                            (Point::ORIGIN, Size::new(1920., 1080.))
-                        };
+                        let loc = Point::new(0., 32.);
+                        let sub_size =
+                            Size::new(unwrapped_size.0 as f32, unwrapped_size.1 as f32 - 32.);
                         self.common
                             .subsurface_rects
                             .insert(output.clone(), Rectangle::new(loc, sub_size));

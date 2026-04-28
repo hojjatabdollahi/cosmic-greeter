@@ -1256,17 +1256,9 @@ impl cosmic::Application for App {
                         let unwrapped_size = size
                             .map(|s| (s.0.unwrap_or(1920), s.1.unwrap_or(1080)))
                             .unwrap_or((1920, 1080));
-                        let (loc, sub_size) = if unwrapped_size.0 > 800 {
-                            (
-                                Point::new(unwrapped_size.0 as f32 / 2. - 400., 32.),
-                                Size::new(800., unwrapped_size.1 as f32 - 32.),
-                            )
-                        } else {
-                            (
-                                Point::new(0., 32.),
-                                Size::new(unwrapped_size.0 as f32, unwrapped_size.1 as f32 - 32.),
-                            )
-                        };
+                        let loc = Point::new(0., 32.);
+                        let sub_size =
+                            Size::new(unwrapped_size.0 as f32, unwrapped_size.1 as f32 - 32.);
                         self.common.window_size.insert(
                             surface_id,
                             Size::new(unwrapped_size.0 as f32, unwrapped_size.1 as f32),
@@ -1855,7 +1847,7 @@ impl cosmic::Application for App {
                     tracing::error!("Randr error: {err}");
                 }
             },
-            Message::RepositionMenu(id, size) => {
+            Message::RepositionMenu(id, _size) => {
                 let Some(subsurface_id) = self
                     .surface_id_pairs
                     .iter()
@@ -1864,12 +1856,7 @@ impl cosmic::Application for App {
                     tracing::error!("Failed to find subsurface menu id");
                     return Task::none();
                 };
-                let loc = if size.width > 800. {
-                    Point::new(size.width / 2. - 400., 32.)
-                } else {
-                    Point::new(0., 32.)
-                };
-                return reposition_subsurface(*subsurface_id, loc.x as i32, loc.y as i32);
+                return reposition_subsurface(*subsurface_id, 0, 32);
             }
             Message::SpinnerTick => {
                 // Update spinner rotation angle (360 degrees per second = 6 degrees per frame at 60fps)
