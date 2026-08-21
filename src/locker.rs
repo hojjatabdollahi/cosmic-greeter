@@ -21,7 +21,7 @@ use std::any::TypeId;
 use std::os::fd::OwnedFd;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use std::{env, fs, process};
 use tokio::sync::mpsc;
 use tracing::level_filters::LevelFilter;
@@ -143,6 +143,9 @@ async fn run_pam_worker(
     let mut stdin = child.stdin.take().expect("worker stdin piped");
     let mut lines = BufReader::new(stdout).lines();
 
+    let mut standing_prompt: Option<String> = None;
+    let mut saw_scan_result = false;
+
     loop {
         let line = match lines.next_line().await {
             Ok(Some(line)) => line,
@@ -169,6 +172,9 @@ async fn run_pam_worker(
                 // Fingerprint sensor text gets its own status line; password
                 // info replaces the prompt label (matching the old behavior).
                 let action = if is_fingerprint {
+                    if standing_prompt.is_none() {
+                        standing_prompt = Some(text.clone());
+                    }
                     Message::FingerprintInfo(Some(text))
                 } else {
                     common::Message::Prompt(text, false, None).into()
@@ -178,6 +184,7 @@ async fn run_pam_worker(
             }
             WorkerMsg::Error(text) => {
                 let action = if is_fingerprint {
+                    saw_scan_result = true;
                     Message::FingerprintInfo(Some(text))
                 } else {
                     Message::Error(text)
@@ -186,7 +193,16 @@ async fn run_pam_worker(
                 continue;
             }
             WorkerMsg::Success => return WorkerOutcome::Success,
-            WorkerMsg::Failure(message) => return WorkerOutcome::Failure(message),
+            WorkerMsg::Failure(message) => {
+                if is_fingerprint && !saw_scan_result {
+                    let _ = msg_tx
+                        .send(cosmic::Action::App(Message::FingerprintInfo(
+                            standing_prompt.take(),
+                        )))
+                        .await;
+                }
+                return WorkerOutcome::Failure(message);
+            }
         };
 
         // A prompt needs typed input. Only the password stack has an input
@@ -884,7 +900,11 @@ impl cosmic::Application for App {
                                                 .unwrap();
 
                                             match run_pam_worker(
-                                                "cosmic-greeter",
+                                                // Password-only stack: reusing
+                                                // "cosmic-greeter" pulls in
+                                                // common-auth, so both workers
+                                                // would claim the same reader.
+                                                "cosmic-greeter-password",
                                                 &username,
                                                 &mut msg_tx,
                                                 Some(value_rx),
@@ -935,6 +955,11 @@ impl cosmic::Application for App {
                                         }
 
                                         tracing::info!("starting fingerprint authentication");
+                                        const RETRY_MIN: Duration = Duration::from_secs(1);
+                                        const RETRY_MAX: Duration = Duration::from_secs(64);
+                                        const ARMED_AFTER: Duration = Duration::from_millis(500);
+                                        let mut retry_delay = RETRY_MIN;
+
                                         loop {
                                             msg_tx
                                                 .send(cosmic::Action::App(
@@ -943,15 +968,18 @@ impl cosmic::Application for App {
                                                 .await
                                                 .unwrap();
 
-                                            match run_pam_worker(
+                                            let started = Instant::now();
+                                            let outcome = run_pam_worker(
                                                 "cosmic-greeter-fingerprint",
                                                 &username,
                                                 &mut msg_tx,
                                                 None,
                                                 true,
                                             )
-                                            .await
-                                            {
+                                            .await;
+                                            let armed = started.elapsed() >= ARMED_AFTER;
+
+                                            match outcome {
                                                 WorkerOutcome::Success => {
                                                     tracing::info!(
                                                         "successfully authenticated (fingerprint)"
@@ -966,13 +994,22 @@ impl cosmic::Application for App {
                                                     tracing::info!(
                                                         "fingerprint attempt failed: {message}"
                                                     );
-                                                    tokio::time::sleep(Duration::from_secs(1))
-                                                        .await;
                                                 }
-                                                WorkerOutcome::Aborted => {
-                                                    tokio::time::sleep(Duration::from_secs(1))
-                                                        .await;
-                                                }
+                                                WorkerOutcome::Aborted => {}
+                                            }
+
+                                            if armed {
+                                                retry_delay = RETRY_MIN;
+                                            } else {
+                                                tracing::warn!(
+                                                    "fingerprint worker gave up after {:?} without arming the reader, retrying in {:?}",
+                                                    started.elapsed(),
+                                                    retry_delay
+                                                );
+                                            }
+                                            tokio::time::sleep(retry_delay).await;
+                                            if !armed {
+                                                retry_delay = (retry_delay * 2).min(RETRY_MAX);
                                             }
                                         }
                                     }
