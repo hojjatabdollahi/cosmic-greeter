@@ -273,7 +273,7 @@ pub enum Message {
     KeyboardLayout(usize),
     Inhibit(Arc<OwnedFd>),
     Submit(String),
-    Surface(surface::Action),
+    Surface(surface::Action<Message>),
     Suspend,
     TimeAppletConfig(TimeAppletConfig),
     Error(String),
@@ -820,9 +820,7 @@ impl cosmic::Application for App {
 
                         if matches!(self.state, State::Locked { .. }) {
                             return get_lock_surface(surface_id, output).chain({
-                                cosmic::task::message(cosmic::Action::Cosmic(
-                                    cosmic::app::Action::Surface(msg),
-                                ))
+                                cosmic::task::message(cosmic::Action::Surface(msg))
                             });
                         }
                     }
@@ -998,9 +996,7 @@ impl cosmic::Application for App {
                                     app.menu(subsurface_id).map(cosmic::Action::App)
                                 })),
                             );
-                            commands.push(cosmic::task::message(cosmic::Action::Cosmic(
-                                cosmic::app::Action::Surface(msg),
-                            )));
+                            commands.push(cosmic::task::message(cosmic::Action::Surface(msg)));
                         } else {
                             tracing::error!("no rectangle for subsurface creation...");
                         }
@@ -1165,9 +1161,7 @@ impl cosmic::Application for App {
                 }
             }
             Message::Surface(a) => {
-                return cosmic::task::message(cosmic::Action::Cosmic(
-                    cosmic::app::Action::Surface(a),
-                ));
+                return cosmic::task::message(cosmic::Action::Surface(a));
             }
         }
         Task::none()

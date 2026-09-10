@@ -389,7 +389,7 @@ pub enum Message {
     Session(String),
     Shutdown,
     Socket(SocketState),
-    Surface(surface::Action),
+    Surface(surface::Action<Message>),
     Suspend,
     Username(String),
     EnterUser(bool, String),
@@ -1309,9 +1309,7 @@ impl cosmic::Application for App {
                                 exclusive_zone: -1,
                                 size_limits: iced::Limits::NONE.min_width(1.0).min_height(1.0),
                             }),
-                            cosmic::task::message(cosmic::Action::Cosmic(
-                                cosmic::app::Action::Surface(msg),
-                            )),
+                            cosmic::task::message(cosmic::Action::Surface(msg)),
                         ]);
                     }
                     OutputEvent::Removed => {
@@ -1659,9 +1657,7 @@ impl cosmic::Application for App {
                 self.greetd_sender = Some(sender);
             }
             Message::Surface(a) => {
-                return cosmic::task::message(cosmic::Action::Cosmic(
-                    cosmic::app::Action::Surface(a),
-                ));
+                return cosmic::task::message(cosmic::Action::Surface(a));
             }
             Message::ScreenReader(enabled) => {
                 if enabled
